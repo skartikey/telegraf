@@ -40,6 +40,16 @@ func generateCert(host string, rsaBits int, certFile, keyFile string, dur time.D
 		}
 	}
 
+	// Ensure temporary directory is cleaned up on error
+	defer func() {
+		if err != nil {
+			if removeErr := os.RemoveAll(dir); removeErr != nil {
+				// Log the cleanup error but don't override the main error
+				_ = removeErr // Acknowledge that we're intentionally ignoring this error
+			}
+		}
+	}()
+
 	if len(host) == 0 {
 		return "", "", &CertificateError{
 			Operation: "validation",
@@ -163,6 +173,8 @@ func generateCert(host string, rsaBits int, certFile, keyFile string, dur time.D
 		}
 	}
 
+	// If we used a temporary directory, note that cleanup is the caller's responsibility
+	// The temporary files will remain until the caller or OS cleans them up
 	return certFile, keyFile, nil
 }
 
@@ -217,6 +229,11 @@ func (o *OpcUAClient) generateClientOpts(endpoints []*ua.EndpointDescription) ([
 			certFile, keyFile, err = generateCert(appuri, 2048, certFile, keyFile, 365*24*time.Hour)
 			if err != nil {
 				return nil, err
+			}
+			// Store paths for cleanup if they are temporary files
+			if o.tempCert == "" && o.tempKey == "" {
+				o.tempCert = certFile
+				o.tempKey = keyFile
 			}
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log" //nolint:depguard // just for debug
 	"net/url"
+	"os"
 	"strconv"
 	"time"
 
@@ -233,13 +234,15 @@ type OpcUAClient struct {
 
 	Client *opcua.Client
 
-	opts  []opcua.Option
-	codes []ua.StatusCode
+	opts     []opcua.Option
+	codes    []ua.StatusCode
+	tempCert string // path to temporary certificate file
+	tempKey  string // path to temporary private key file
 }
 
 // SetupOptions reads the endpoints from the specified server and sets up all authentication
-func (o *OpcUAClient) SetupOptions() error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.Config.ConnectTimeout))
+func (o *OpcUAClient) SetupOptions(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(o.Config.ConnectTimeout))
 	defer cancel()
 	// Get a list of the endpoints for our target server
 	endpoints, err := opcua.GetEndpoints(ctx, o.Config.Endpoint)
@@ -261,6 +264,9 @@ func (o *OpcUAClient) SetupOptions() error {
 
 			o.Config.Certificate = cert
 			o.Config.PrivateKey = privateKey
+			// Store paths for cleanup
+			o.tempCert = cert
+			o.tempKey = privateKey
 		}
 	}
 
@@ -302,10 +308,11 @@ func (o *OpcUAClient) Connect(ctx context.Context) error {
 
 	switch u.Scheme {
 	case "opc.tcp":
-		if err := o.SetupOptions(); err != nil {
+		if err := o.SetupOptions(ctx); err != nil {
 			return err
 		}
 
+		// Close existing connection if present
 		if o.Client != nil {
 			o.Log.Warnf("Closing connection to %q as already connected", u)
 			if err := o.Client.Close(ctx); err != nil {
@@ -322,9 +329,14 @@ func (o *OpcUAClient) Connect(ctx context.Context) error {
 				Err:      fmt.Errorf("%w: failed to create client: %w", ErrConnectionFailed, err),
 			}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.Config.ConnectTimeout))
+
+		// Use the provided context with connect timeout
+		connectCtx, cancel := context.WithTimeout(ctx, time.Duration(o.Config.ConnectTimeout))
 		defer cancel()
-		if err := o.Client.Connect(ctx); err != nil {
+
+		if err := o.Client.Connect(connectCtx); err != nil {
+			// Clean up client on connection failure
+			o.Client = nil
 			return &EndpointError{
 				Endpoint: o.Config.Endpoint,
 				Err:      fmt.Errorf("%w: %w", ErrConnectionFailed, err),
@@ -343,6 +355,12 @@ func (o *OpcUAClient) Connect(ctx context.Context) error {
 
 func (o *OpcUAClient) Disconnect(ctx context.Context) error {
 	o.Log.Debug("Disconnecting from OPC UA Server")
+
+	// Early return if no client to disconnect
+	if o.Client == nil {
+		return nil
+	}
+
 	u, err := url.Parse(o.Config.Endpoint)
 	if err != nil {
 		return &EndpointError{
@@ -353,12 +371,17 @@ func (o *OpcUAClient) Disconnect(ctx context.Context) error {
 
 	switch u.Scheme {
 	case "opc.tcp":
-		// We can't do anything about failing to close a connection
-		err := o.Client.Close(ctx)
-		o.Client = nil
-		if err != nil {
+		// Ensure client is set to nil regardless of close result
+		defer func() {
+			o.Client = nil
+		}()
+
+		if err := o.Client.Close(ctx); err != nil {
 			return fmt.Errorf("failed to close connection to %s: %w", o.Config.Endpoint, err)
 		}
+
+		// Clean up temporary certificate files
+		o.cleanupTempCerts()
 		return nil
 	default:
 		return &EndpointError{
@@ -373,4 +396,21 @@ func (o *OpcUAClient) State() ConnectionState {
 		return Disconnected
 	}
 	return ConnectionState(o.Client.State())
+}
+
+// cleanupTempCerts removes temporary certificate files created during connection setup
+func (o *OpcUAClient) cleanupTempCerts() {
+	if o.tempCert != "" {
+		if err := os.Remove(o.tempCert); err != nil {
+			o.Log.Debugf("Failed to clean up temporary certificate file %s: %v", o.tempCert, err)
+		}
+		o.tempCert = ""
+	}
+
+	if o.tempKey != "" {
+		if err := os.Remove(o.tempKey); err != nil {
+			o.Log.Debugf("Failed to clean up temporary key file %s: %v", o.tempKey, err)
+		}
+		o.tempKey = ""
+	}
 }
